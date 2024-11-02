@@ -1,0 +1,256 @@
+#!/bin/bash
+# Correction Automatique avec l'API Reverso - Script Bash
+
+# Définir les couleurs pour les messages terminal
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+
+# Configuration de la fenêtre
+WINDOW_TIMEOUT=5  # La fenêtre disparaît après 5< secondes si pas d'action
+
+# Essayer de définir la locale française, sinon utiliser C.UTF-8
+if locale -a | grep -q "fr_FR.utf8"; then
+    export LANG=fr_FR.UTF-8
+    export LC_ALL=fr_FR.UTF-8
+else
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+fi
+
+# Fonction pour afficher les messages d'erreur
+error_exit() {
+    yad --center \
+        --undecorated \
+        --close-on-unfocus \
+        --timeout=$WINDOW_TIMEOUT \
+        --width=300 \
+        --image=dialog-error \
+        --text="<span color='red'><b>Erreur:</b> $1</span>" \
+        --button=gtk-close \
+        --borders=20 \
+        --css="window { background-color: #FFFFD4; }"
+    echo -e "${RED}Erreur: $1${NC}" >&2
+    exit 1
+}
+
+# Fonction pour affiché le popup des correction
+show_corrections_popup() {
+    local corrections="$1"
+    local popup_content="<span font='11'>"
+
+    # Obtenir la position actuelle de la souris
+    local mouse_info
+    mouse_info=$(xdotool getmouselocation)
+    local posx
+    local posy
+    posx=$(echo "$mouse_info" | grep -oP 'x:\K\d+')
+    posy=$(echo "$mouse_info" | grep -oP 'y:\K\d+')
+
+    # Ajuster la position pour être quelques pixels au-dessus de la souris
+    local offset=200  # Nombre de pixels au-dessus de la souris
+    posy=$((posy - offset))
+
+    # S'assurer que posy n'est pas négatif
+    if [ "$posy" -lt 0 ]; then
+        posy=0
+    fi
+
+    # Vérifier si la réponse est un JSON valide
+    if ! echo "$corrections" | jq -e . >/dev/null 2>&1; then
+        error_exit "Réponse invalide de Reverso"
+        return 1
+    fi
+
+    # Extraire les corrections
+    local corrections_array
+    corrections_array=$(echo "$corrections" | jq -r '.corrections[] | "\(.mistakeText)|\(.correctionText)"' 2>/dev/null)
+
+    while IFS="|" read -r mistake fixed; do
+        if [ ! -z "$mistake" ] && [ ! -z "$fixed" ]; then
+            popup_content+="<span color='#FF6B6B'><i>$mistake</i></span>"
+            popup_content+=" <span color='#4ECDC4'>→</span> "
+            popup_content+="<span color='#95E1D3'><b>$fixed</b></span>\n"
+        fi
+    done <<< "$corrections_array"
+
+    popup_content+="</span>"
+
+    # Afficher le popup à la position ajustée
+    yad --undecorated \
+        --close-on-unfocus \
+        --timeout=$WINDOW_TIMEOUT \
+        --width=400 \
+        --image=edit-find \
+        --text-align=left \
+        --text="<b>Corrections suggérées:</b>\n\n$popup_content" \
+        --borders=20 \
+        --no-buttons \
+        --posx="$posx" \
+        --posy="$posy" \
+        --css="window { background-color: #FFFFD4; }"
+}
+
+# Fonction pour vérifier les dépendances
+check_dependencies() {
+    local deps=("curl" "yad" "xdotool" "xclip" "jq")
+    local missing=()
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing+=("$dep")
+        fi
+    done
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        error_exit "Veuillez installer: ${missing[*]}\nSous Arch Linux: 'sudo pacman -S ${missing[*]}'"
+    fi
+}
+
+# Fonction pour récupérer le texte sélectionné
+get_selected_text() {
+    local text
+    text=$(xclip -selection primary -o 2>/dev/null | tr -d '\n') || \
+        error_exit "Impossible de lire la sélection"
+
+    if [ -z "$text" ]; then
+        error_exit "Aucun texte sélectionné"
+    fi
+    echo "$text"
+}
+
+# Nouvelle fonction pour récupérer le texte du presse-papier
+get_clipboard_text() {
+    local text
+    text=$(xclip -selection clipboard -o 2>/dev/null | tr -d '\n') || \
+        error_exit "Impossible de lire le presse-papier"
+
+    if [ -z "$text" ]; then
+        error_exit "Le presse-papier est vide"
+    fi
+    echo "$text"
+}
+
+# Fonction pour envoyer la requête à l'API Reverso
+send_to_reverso() {
+    local text="$1"
+    local url="https://orthographe.reverso.net/api/v1/Spelling"
+    local payload
+    local response
+
+    payload=$(jq -n \
+        --arg text "$text" \
+        '{
+            englishDialect: "indifferent",
+            autoReplace: true,
+            getCorrectionDetails: true,
+            interfaceLanguage: "fr",
+            locale: "",
+            language: "fra",
+            text: $text,
+            originalText: "",
+            origin: "interactive",
+            isHtml: false,
+            IsUserPremium: false
+        }' 2>/dev/null) || error_exit "Erreur lors de la création de la requête"
+
+    response=$(curl -s "$url" \
+        -H "Content-Type: application/json" \
+        -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0" \
+        -d "$payload") || error_exit "Erreur de connexion à Reverso"
+
+    if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+        error_exit "Réponse invalide de Reverso"
+    fi
+
+    if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        error_exit "Erreur Reverso: $(echo "$response" | jq -r '.error // "Erreur inconnue"')"
+    fi
+
+    echo "$response"
+}
+
+# Fonction pour traiter les corrections et les appliquer
+process_corrections() {
+    local response="$1"
+
+    if ! echo "$response" | jq -e '.corrections[0]' >/dev/null 2>&1; then
+        yad --center \
+            --undecorated \
+            --close-on-unfocus \
+            --timeout=2 \
+            --width=200 \
+            --image=gtk-ok \
+            --text="<span color='green'><b>Texte correct</b></span>" \
+            --no-buttons \
+            --borders=20 \
+            --posx=1520 \
+            --posy=40 \
+            --css="window { background-color: #FFFFD4; }"
+        exit 0
+    fi
+
+    show_corrections_popup "$response"
+
+    local corrected_text
+    corrected_text=$(echo "$response" | jq -r '.text // empty' | tr -d '\n')
+
+    if [ -z "$corrected_text" ]; then
+        error_exit "Impossible de récupérer le texte corrigé"
+    fi
+
+    printf "%s" "$corrected_text" | xclip -selection clipboard
+    sleep 0.1
+    xdotool key ctrl+v
+
+    echo -e "${GREEN}Texte corrigé et remplacé${NC}"
+}
+
+# Fonction pour afficher l'aide
+show_usage() {
+    echo "Usage: $0 [-s|-c]"
+    echo "Options:"
+    echo "  -s    Utiliser le texte sélectionné"
+    echo "  -c    Utiliser le texte du presse-papier"
+    echo "  -h    Afficher cette aide"
+    exit 1
+}
+
+# Modification du programme principal pour gérer les arguments
+main() {
+    check_dependencies
+    
+    local text_source="selection"  # Valeur par défaut
+    
+    # Traitement des arguments
+    while getopts "sch" opt; do
+        case ${opt} in
+            s)
+                text_source="selection"
+                ;;
+            c)
+                text_source="clipboard"
+                ;;
+            h|*)
+                show_usage
+                ;;
+        esac
+    done
+    
+    local selected_text
+    case $text_source in
+        "selection")
+            selected_text=$(get_selected_text)
+            ;;
+        "clipboard")
+            selected_text=$(get_clipboard_text)
+            ;;
+    esac
+    
+    local response
+    response=$(send_to_reverso "$selected_text")
+    process_corrections "$response"
+}
+
+# Exécuter le programme principal
+main
